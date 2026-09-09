@@ -13,6 +13,7 @@ from src.analysis.technical_indicators import TechnicalIndicators
 from src.analysis.market_analyzer import MarketAnalyzer
 from src.data.symbol_resolver import SymbolResolver
 from src.analysis.market_scanner import MarketScanner
+from src.news.news_processor import NewsProcessor
 
 # Set page config
 st.set_page_config(
@@ -76,9 +77,11 @@ def get_components():
     market_analyzer = MarketAnalyzer()
     symbol_resolver = SymbolResolver()
     market_scanner = MarketScanner()
-    return db_manager, data_processor, market_analyzer, symbol_resolver, market_scanner
+    news_processor = NewsProcessor(db_manager=db_manager)
+    return db_manager, data_processor, market_analyzer, symbol_resolver, market_scanner, news_processor
 
-db_manager, data_processor, market_analyzer, symbol_resolver, market_scanner = get_components()
+db_manager, data_processor, market_analyzer, symbol_resolver, market_scanner, news_processor = get_components()
+
 
 # --- PAGE NAVIGATION & STATE ---
 if "current_page" not in st.session_state:
@@ -97,6 +100,10 @@ if "failed_stocks" not in st.session_state:
     st.session_state.failed_stocks = []
 if "skipped_count" not in st.session_state:
     st.session_state.skipped_count = 0
+if "news_data" not in st.session_state:
+    st.session_state.news_data = None
+if "news_time_filter" not in st.session_state:
+    st.session_state.news_time_filter = "Last 7 Days"
 
 st.sidebar.markdown("### Navigation")
 page_options = ["🏠 Market Scanner", "📊 Stock Analysis"]
@@ -440,6 +447,19 @@ else:
                         st.session_state.market_data = df_with_indicators
                         st.session_state.analysis = analysis_res
                         st.session_state.fallback_used = fallback_used
+
+                        # Process News & Sentiment
+                        try:
+                            c_name = news_processor.fetcher.get_company_name(symbol)
+                            st.session_state.news_data = news_processor.process_news(
+                                symbol=symbol,
+                                company_name=c_name,
+                                time_filter=st.session_state.news_time_filter,
+                                force_refresh=refresh_button
+                            )
+                        except Exception as n_err:
+                            log_error("app", "NewsError", f"Failed to fetch news for {symbol}: {str(n_err)}", "Ignore and continue", exc_info=True)
+                            st.session_state.news_data = None
                         
                         if fallback_used:
                             st.warning("⚠️ Network connection failed. Displaying cached data from local database.")
@@ -652,5 +672,125 @@ else:
         </div>
         """, unsafe_allow_html=True)
         
+        # ==================================================
+        # 📰 NEWS & SENTIMENT ANALYSIS SECTION
+        # ==================================================
+        st.markdown("---")
+        st.subheader("📰 News & Sentiment Analysis")
+        
+        # News control bar: Time Filter and Refresh News
+        col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 1, 3])
+        with col_ctrl1:
+            time_filter_options = ["Last 24 Hours", "Last 7 Days", "Last 30 Days"]
+            current_filter_idx = (
+                time_filter_options.index(st.session_state.news_time_filter)
+                if st.session_state.news_time_filter in time_filter_options
+                else 1
+            )
+            selected_filter = st.selectbox(
+                "Filter News Period",
+                options=time_filter_options,
+                index=current_filter_idx,
+                key="news_filter_select"
+            )
+            
+        with col_ctrl2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            refresh_news_btn = st.button("🔄 Refresh News", key="btn_refresh_news", use_container_width=True)
+            
+        # If filter changed or user clicked refresh news, or news_data not loaded yet, recalculate
+        needs_news_reload = (
+            selected_filter != st.session_state.news_time_filter
+            or refresh_news_btn
+            or st.session_state.news_data is None
+            or st.session_state.news_data.get("symbol") != symbol_display
+        )
+        
+        if needs_news_reload:
+            st.session_state.news_time_filter = selected_filter
+            with st.spinner(f"Analyzing news for {symbol_display} ({selected_filter})..."):
+                try:
+                    c_name = news_processor.fetcher.get_company_name(symbol_display)
+                    st.session_state.news_data = news_processor.process_news(
+                        symbol=symbol_display,
+                        company_name=c_name,
+                        time_filter=selected_filter,
+                        force_refresh=refresh_news_btn
+                    )
+                except Exception as n_err:
+                    log_error("app", "NewsError", f"Error updating news: {str(n_err)}", "Display error in UI", exc_info=True)
+                    st.session_state.news_data = None
+
+        news_res = st.session_state.news_data
+        
+        if news_res and news_res.get("total_news", 0) > 0:
+            # 1. Overall Sentiment Metrics
+            ov_sentiment = news_res.get("overall_sentiment", "Neutral")
+            ov_score = news_res.get("overall_score", 0.0)
+            ov_conf = news_res.get("overall_confidence", 50.0)
+            total_n = news_res.get("total_news", 0)
+            pos_n = news_res.get("positive_count", 0)
+            neg_n = news_res.get("negative_count", 0)
+            neu_n = news_res.get("neutral_count", 0)
+            
+            sent_icon = "🟢" if ov_sentiment == "Positive" else "🔴" if ov_sentiment == "Negative" else "🟡"
+            sent_color = "#10b981" if ov_sentiment == "Positive" else "#ef4444" if ov_sentiment == "Negative" else "#eab308"
+            score_prefix = "+" if ov_score > 0 else ""
+            
+            m_col1, m_col2, m_col3, m_col4, m_col5, m_col6, m_col7 = st.columns(7)
+            m_col1.metric("Overall Sentiment", f"{sent_icon} {ov_sentiment}")
+            m_col2.metric("Overall Score", f"{score_prefix}{ov_score:+.2f}")
+            m_col3.metric("Confidence", f"{ov_conf:.1f}%")
+            m_col4.metric("Total News", total_n)
+            m_col5.metric("🟢 Positive", pos_n)
+            m_col6.metric("🔴 Negative", neg_n)
+            m_col7.metric("🟡 Neutral", neu_n)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown(f"#### Recent Articles ({selected_filter})")
+            
+            # 2. Individual News Articles List
+            articles_list = news_res.get("articles", [])
+            for idx, article in enumerate(articles_list):
+                art_sent = article.get("sentiment", "Neutral")
+                art_score = float(article.get("sentiment_score", 0.0))
+                art_conf = float(article.get("confidence", 50.0))
+                art_score_str = f"+{art_score:.2f}" if art_score > 0 else f"{art_score:.2f}"
+                
+                art_color = "#10b981" if art_sent == "Positive" else "#ef4444" if art_sent == "Negative" else "#eab308"
+                art_badge = f"🟢 Positive" if art_sent == "Positive" else f"🔴 Negative" if art_sent == "Negative" else f"🟡 Neutral"
+                
+                headline = article.get("headline", "No title")
+                description = article.get("description", "")
+                source = article.get("source", "Financial News")
+                pub_date = article.get("published_date", "")
+                url = article.get("url", "")
+                
+                link_html = f'<a href="{url}" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 600;">🔗 Read Full Article ↗</a>' if url else '<span style="color: #64748b;">No URL available</span>'
+                
+                card_html = f"""
+                <div style="background-color: #1e293b; border-left: 4px solid {art_color}; padding: 14px 18px; border-radius: 6px; margin-bottom: 12px; border-top: 1px solid #334155; border-right: 1px solid #334155; border-bottom: 1px solid #334155;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                        <span style="font-weight: 600; font-size: 0.95rem; color: {art_color};">{art_badge}</span>
+                        <span style="font-size: 0.82rem; color: #94a3b8;">📅 {pub_date} &bull; 📰 {source}</span>
+                    </div>
+                    <div style="font-size: 1.05rem; font-weight: 600; color: #f8fafc; margin-bottom: 8px;">
+                        {headline}
+                    </div>
+                    <div style="font-size: 0.9rem; color: #cbd5e1; margin-bottom: 10px;">
+                        {description}
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; color: #94a3b8; border-top: 1px solid #334155; padding-top: 8px;">
+                        <span>Sentiment Score: <strong style="color: #f8fafc;">{art_score_str}</strong> &nbsp;|&nbsp; Confidence: <strong style="color: #f8fafc;">{art_conf:.1f}%</strong></span>
+                        {link_html}
+                    </div>
+                </div>
+                """
+                st.markdown(card_html, unsafe_allow_html=True)
+                
+        else:
+            st.info("No recent relevant news available for this stock.")
+        
     else:
         st.info("👈 Enter a Stock symbol or select one from the sidebar and click 'Fetch & Analyze' to display results.")
+

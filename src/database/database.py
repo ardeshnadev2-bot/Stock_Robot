@@ -7,11 +7,16 @@ from src.utils.logger import log_info, log_error
 from src.database.models import (
     CREATE_MARKET_DATA_TABLE,
     CREATE_ANALYSIS_RESULTS_TABLE,
+    CREATE_STOCK_NEWS_TABLE,
     UPSERT_MARKET_DATA,
     UPSERT_ANALYSIS_RESULT,
+    UPSERT_STOCK_NEWS,
     SELECT_MARKET_DATA,
     SELECT_MARKET_DATA_DATE_RANGE,
-    SELECT_LATEST_ANALYSIS
+    SELECT_LATEST_ANALYSIS,
+    SELECT_STOCK_NEWS_BY_SYMBOL,
+    SELECT_STOCK_NEWS_DATE_RANGE,
+    SELECT_CACHED_ARTICLE_SENTIMENT
 )
 
 class DatabaseManager:
@@ -48,6 +53,7 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(CREATE_MARKET_DATA_TABLE)
             cursor.execute(CREATE_ANALYSIS_RESULTS_TABLE)
+            cursor.execute(CREATE_STOCK_NEWS_TABLE)
             conn.commit()
         return True
 
@@ -187,3 +193,92 @@ class DatabaseManager:
         if row:
             return dict(row)
         return None
+
+    @handle_db_errors(default_return=0)
+    def save_news_articles(self, articles: list[dict]) -> int:
+        """
+        Saves a list of analyzed news articles to SQLite with duplicate prevention.
+        
+        Args:
+            articles (list[dict]): List of news article dicts with sentiment fields.
+            
+        Returns:
+            int: Number of articles inserted or updated.
+        """
+        if not articles:
+            return 0
+            
+        rows_saved = 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            data_to_insert = []
+            import hashlib
+            for art in articles:
+                article_key = art.get("article_key")
+                if not article_key:
+                    raw_id = art.get("url") or f"{art.get('symbol', '')}_{art.get('headline', '')}"
+                    article_key = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()
+                    
+                data_to_insert.append((
+                    art.get("symbol", ""),
+                    art.get("company_name", ""),
+                    art.get("headline", ""),
+                    art.get("description", ""),
+                    art.get("source", ""),
+                    art.get("url", ""),
+                    str(art.get("published_date", "")),
+                    art.get("sentiment", "Neutral"),
+                    float(art.get("sentiment_score", 0.0)),
+                    float(art.get("confidence", 0.0)),
+                    article_key
+                ))
+            cursor.executemany(UPSERT_STOCK_NEWS, data_to_insert)
+            conn.commit()
+            rows_saved = len(data_to_insert)
+            
+        log_info("database", f"Saved/Updated {rows_saved} news articles in SQLite.")
+        return rows_saved
+
+    @handle_db_errors(default_return=[])
+    def get_cached_news(self, symbol: str, start_date: str = None) -> list[dict]:
+        """
+        Retrieves cached news articles for a stock symbol from SQLite.
+        
+        Args:
+            symbol (str): Stock symbol.
+            start_date (str, optional): Cutoff date filter.
+            
+        Returns:
+            list[dict]: List of news article dictionaries.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if start_date:
+                cursor.execute(SELECT_STOCK_NEWS_DATE_RANGE, (symbol, start_date))
+            else:
+                cursor.execute(SELECT_STOCK_NEWS_BY_SYMBOL, (symbol,))
+            rows = cursor.fetchall()
+            
+        return [dict(row) for row in rows]
+
+    @handle_db_errors(default_return=None)
+    def get_cached_article_sentiment(self, article_key: str) -> dict | None:
+        """
+        Retrieves cached sentiment for an article if already analyzed.
+        
+        Args:
+            article_key (str): Unique hash or key for the article.
+            
+        Returns:
+            dict | None: Cached sentiment dict or None if not cached.
+        """
+        if not article_key:
+            return None
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(SELECT_CACHED_ARTICLE_SENTIMENT, (article_key,))
+            row = cursor.fetchone()
+        if row:
+            return dict(row)
+        return None
+
